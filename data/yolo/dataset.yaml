@@ -1,0 +1,11 @@
+path: /Users/peytocas/Documents/pdf-form-filler/data/yolo
+train: images/train
+val: images/val
+names:
+  0: text_input
+  1: checkbox
+  2: radio_button
+  3: dropdown
+  4: signature
+  5: button
+  6: other_field
