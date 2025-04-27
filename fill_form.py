@@ -50,17 +50,10 @@ if not PROJECT_ID:
 
 # --- Drawing Helper Functions ---
 
-def draw_text_on_image(image, text, position, font_path="arial.ttf", font_size=12, color="black"):
-    """Draws text onto a PIL Image object."""
+def draw_text_on_image(image, text, position, font, color="black"):
+    """Draws text onto a PIL Image object using a pre-loaded font."""
     draw = ImageDraw.Draw(image)
-    try:
-        # Load the font
-        font = ImageFont.truetype(font_path, font_size)
-    except IOError:
-        print(f"Warning: Font '{font_path}' not found. Using default font.")
-        # Fallback to Pillow's default bitmap font if the TrueType font fails
-        font = ImageFont.load_default()
-    # Draw the text
+    # Draw the text using the provided font object
     draw.text(position, text, fill=color, font=font)
     return image
 
@@ -103,40 +96,49 @@ def crop_with_padding(image, box, padding=30):
     return image.crop((x0, y0, x1, y1))
 
 # --- Gemini Interaction ---
-def get_match_from_gemini(model, image_crop, field_type, available_data_list):
+def get_match_from_gemini(model, highlighted_image_bytes, field_type, available_data_items):
     """
-    Asks Gemini to match a field crop with available data.
+    Asks Gemini to match a highlighted field on the full image with available data items.
 
     Args:
         model: Initialized Vertex AI GenerativeModel.
-        image_crop: PIL Image object of the cropped field area.
+        highlighted_image_bytes: Bytes of the full form image with one field's bounding box drawn on it.
         field_type: String describing the field type (e.g., 'text_input').
-        available_data_list: List of data values currently available.
+        available_data_items: List of data item dictionaries ({'description': ..., 'value': ...}) currently available.
 
     Returns:
-        The matched data value from the list, or None if no match found.
+        The matched data item dictionary from the list, or None if no match found.
     """
-    # Convert PIL Image to bytes
-    buffer = BytesIO()
-    image_crop.save(buffer, format="PNG")
-    image_bytes = buffer.getvalue()
+    if not available_data_items:
+        return None # Nothing to match against
 
-    # Corrected prompt f-string
-    prompt = f"""Analyze the following form field image crop.
-Field Type Hint: {field_type}
+    # No image conversion needed here, bytes are passed in
 
-Available data options:
-{available_data_list}
+    # Format available data for the prompt, including index
+    options_str = "\\n".join([
+        f"{i+1}. Description: {item['description']}, Value: {repr(item['value'])}"
+        for i, item in enumerate(available_data_items)
+    ])
 
-Which single data value from the list is the most appropriate match for this field?
-Respond with ONLY the matched data value from the list provided, and nothing else.
-If no value seems appropriate, respond with 'None'."""
+    # Updated prompt: Refer to the highlighted box on the single image
+    prompt = f"""Analyze the provided form image. One field on the form is highlighted with a bounding box.
+Focus on the field inside the **highlighted bounding box**.
+Field Type Hint for the highlighted field: {field_type}
 
-    # Prepare multimodal input
-    image_part = Part.from_data(data=image_bytes, mime_type="image/png")
+Available data items (with index numbers):
+{options_str}
+
+Which single data item index number (from 1 to {len(available_data_items)}) from the list above is the most appropriate match for the field inside the **highlighted bounding box**?
+Consider the visual appearance of the highlighted field, its context within the full form, and the description/value of the data items.
+
+Respond with ONLY the index number of the best matching data item.
+If no data item seems appropriate, respond with the exact string 'None'."""
+
+    # Prepare multimodal input (single highlighted image)
+    image_part = Part.from_data(data=highlighted_image_bytes, mime_type="image/png")
     contents = [image_part, prompt]
 
-    # Configure safety settings if needed (optional)
+    # Configure safety settings (can reuse existing ones or customize)
     safety_settings = {
         HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
         HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
@@ -144,13 +146,13 @@ If no value seems appropriate, respond with 'None'."""
         HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
     }
 
-    # Configure generation settings (optional)
+    # Configure generation settings (adjust as needed, reduce max tokens for index)
     generation_config = GenerationConfig(
-        temperature=0.1, # Lower temperature for more deterministic response
+        temperature=0.1,
         top_p=0.8,
         top_k=5,
         candidate_count=1,
-        max_output_tokens=8192,
+        max_output_tokens=10, # Expecting just an index or 'None'
     )
 
     try:
@@ -160,24 +162,33 @@ If no value seems appropriate, respond with 'None'."""
             safety_settings=safety_settings,
             stream=False,
         )
-        # Extract the text response
-        matched_value_str = response.text.strip()
+        response_text = response.text.strip()
+        print(f"    Gemini Match Response for Highlighted Box: {response_text}")
 
-        # Very basic validation: Check if the response is *exactly* one of the available data items (converted to string)
-        # This is crucial because the model might hallucinate or add extra text.
-        for item in available_data_list:
-            if matched_value_str == str(item):
-                 # Find the original item (preserving type, e.g., bool)
-                for original_item in available_data_list:
-                    if str(original_item) == matched_value_str:
-                        print(f"  Gemini matched: {original_item}")
-                        return original_item # Return the original item with its type
+        if response_text.lower() == 'none':
+            print("    -> Gemini indicated no match for this highlighted box.")
+            return None
 
-        print(f"  Gemini response '{matched_value_str}' not found exactly in available data.")
-        return None # Indicate no valid match found
+        # Attempt to parse the index (1-based from prompt)
+        try:
+            matched_index_one_based = int(response_text)
+            matched_index_zero_based = matched_index_one_based - 1
+
+            # Validate the index
+            if 0 <= matched_index_zero_based < len(available_data_items):
+                matched_item = available_data_items[matched_index_zero_based]
+                print(f"    -> Gemini matched highlighted box to Item Index {matched_index_one_based}: {matched_item['description']}")
+                return matched_item # Return the original dictionary
+            else:
+                print(f"    Error: Gemini returned invalid index {matched_index_one_based} for {len(available_data_items)} available items.")
+                return None
+
+        except ValueError:
+            print(f"    Error: Could not parse index from Gemini response '{response_text}'. Expected an integer or 'None'.")
+            return None
 
     except Exception as e:
-        print(f"Error calling Gemini API: {e}")
+        print(f"    Error calling Gemini API for crop matching: {e}")
         return None
 
 # --- Phase 1: Generate Plan --- (NEW FUNCTION)
@@ -186,28 +197,29 @@ def generate_filling_plan(model, form_image_bytes, data_to_fill):
     print("--- Phase 1: Generating Filling Plan with Gemini ---")
 
     # Prepare prompt
-    data_list_str = "\n".join([f"- {repr(item)}" for item in data_to_fill]) # Represent data clearly
+    # Updated to handle list of dictionaries with 'description' and 'value'
+    data_list_str = "\\n".join([f"- Description: {item['description']}, Value: {repr(item['value'])}" for item in data_to_fill])
     prompt = f"""Analyze the provided form image visually.
-Based ONLY on the visual layout and field labels/questions on the form, identify the distinct fillable fields (e.g., 'Full Name text input', '1. Available Nov 1-Apr 24 (Yes checkbox)', '10. Preferred Mon checkbox', '3. Experience text input', etc.).
+Based ONLY on the visual layout and field labels/questions on the form, identify the distinct fillable fields (e.g., 'Full Name text input', '1. Available Nov-Apr 24 (Yes checkbox)', '10. Preferred Mon checkbox', '3. Experience text input', etc.).
 
-Now, look at the provided list of data values:
+Now, look at the provided list of data items, each with a description and a value:
 {data_list_str}
 
-Create a plan by matching EACH data value from the list to EXACTLY ONE of the visually identified fields on the form. Ensure the data type seems appropriate for the field type (e.g., boolean for checkbox, string for text input).
+Create a plan by matching EACH data item (using its description and value) from the list to EXACTLY ONE of the visually identified fields on the form. Ensure the data type seems appropriate for the field type (e.g., boolean for checkbox, string for text input).
 
 Format the output STRICTLY as a JSON object containing two keys:
-1.  `"plan"`: An object where keys are descriptive strings uniquely identifying the field on the form (use question number or nearby text for context), and values are the corresponding data values from the list that should go there.
-2.  `"unmatched_data"`: A list containing any data values from the provided list that could not be confidently matched to a visual field on the form.
+1.  `"plan"`: An object where keys are descriptive strings uniquely identifying the field on the form (use question number or nearby text for context), and values are the corresponding *original data item dictionary* (containing both 'description' and 'value') from the list that should go there.
+2.  `"unmatched_data"`: A list containing any data item dictionaries from the provided list that could not be confidently matched to a visual field on the form.
 
-Example of desired JSON output format:
+Example of desired JSON output format (note the value in the plan is the original dictionary):
 ```json
 {{
   "plan": {{
-    "1. Available Nov 1-Apr 24 (Yes checkbox)": true,
-    "3. Experience (text input)": "Server at Cafe Bistro...",
-    "10. Preferred Monday (checkbox)": true
+    "1. Available Nov 1-Apr 24 (Yes checkbox)": {{ "description": "Availability Status Nov-Apr", "value": true }},
+    "3. Experience (text input)": {{ "description": "Work Experience Details", "value": "Server at Cafe Bistro..." }},
+    "10. Preferred Monday (checkbox)": {{ "description": "Prefers Monday", "value": true }}
   }},
-  "unmatched_data": [ "Some leftover data" ]
+  "unmatched_data": [ {{ "description": "Leftover Data Field", "value": "Some leftover data" }} ]
 }}
 ```
 
@@ -226,7 +238,7 @@ Provide ONLY the JSON object in your response, enclosed in ```json ... ```.
         candidate_count=1,
         max_output_tokens=8192, # Allow enough tokens for potentially large JSON
         # Specify JSON response type (if using a model version that supports it explicitly)
-        # response_mime_type="application/json", # Uncomment if supported and desired
+        response_mime_type="application/json", # Uncomment if supported and desired
     )
 
     # Configure safety settings (optional but recommended)
@@ -260,25 +272,90 @@ Provide ONLY the JSON object in your response, enclosed in ```json ... ```.
             # Assume the whole response might be JSON if markdown is missing
             json_string = raw_text.strip()
 
+        # Replace Python bools/None with JSON bools/null before parsing
+        # Handles booleans/None both as values in key-value pairs and as elements in lists
+        replacements = {
+            ": True,": ": true,",
+            ": False,": ": false,",
+            ": None,": ": null,",
+            ": True}": ": true}",
+            ": False}": ": false}",
+            ": None}": ": null}",
+            ": True\n": ": true\n",
+            ": False\n": ": false\n",
+            ": None\n": ": null\n",
+            "[True": "[true",
+            "[False": "[false",
+            "[None": "[null",
+            ", True": ", true",
+            ", False": ", false",
+            ", None": ", null",
+            " True]": " true]",
+            " False]": " false]",
+            " None]": " null]",
+            "True,": "true,", # Added for standalone list items
+            "False,": "false,", # Added for standalone list items
+            "None,": "null," # Added for standalone list items
+            # Add more specific cases if needed, but this covers common scenarios
+        }
+        for py_literal, json_literal in replacements.items():
+            json_string = json_string.replace(py_literal, json_literal)
+
+        # Final check for simple True/False at the end of a list item (less common but possible)
+        json_string = json_string.replace("True]", "true]")
+        json_string = json_string.replace("False]", "false]")
+        json_string = json_string.replace("None]", "null]")
+
         try:
             parsed_result = json.loads(json_string)
             # Basic validation of structure
             if isinstance(parsed_result, dict) and "plan" in parsed_result and "unmatched_data" in parsed_result:
                 print("Plan generation and JSON parsing successful.")
-                # Ensure plan values are drawn from original data list (potential type coercion fix)
+                # --- Type Correction Logic - Needs Adaptation ---
+                # The plan now holds dictionaries, not just values. We need to ensure these dictionaries
+                # are the *original* dictionaries from data_to_fill to preserve types correctly,
+                # especially for boolean values that might be stringified/parsed differently.
                 plan_dict = parsed_result.get("plan", {})
-                original_data_map = {str(item): item for item in data_to_fill}
+                unmatched_list = parsed_result.get("unmatched_data", [])
                 corrected_plan = {}
-                for key, value_from_json in plan_dict.items():
-                    # Find the original data item to preserve type
-                    original_value = original_data_map.get(str(value_from_json))
-                    if original_value is not None:
-                        corrected_plan[key] = original_value
+                corrected_unmatched = []
+
+                # Create a mapping of string representations of values (or descriptions) for lookup
+                original_data_map = { item['description']: item for item in data_to_fill } # Match based on description? Or a combo? Using description for now.
+
+                # Correct the plan items
+                for field_desc, planned_item_dict in plan_dict.items():
+                    if isinstance(planned_item_dict, dict) and 'description' in planned_item_dict:
+                        # Try to find the original dictionary based on description
+                        original_item = original_data_map.get(planned_item_dict['description'])
+                        if original_item:
+                             # Check if value roughly matches (handles potential type changes during JSON conversion)
+                             if str(original_item['value']) == str(planned_item_dict.get('value')):
+                                corrected_plan[field_desc] = original_item # Use the original item
+                             else:
+                                print(f"Warning: Value mismatch for description '{planned_item_dict['description']}'. Plan: {planned_item_dict.get('value')}, Original: {original_item['value']}. Using original.")
+                                corrected_plan[field_desc] = original_item # Still prefer original structure
+                        else:
+                            print(f"Warning: Could not find original data item for plan description '{planned_item_dict['description']}'. Using item from plan directly.")
+                            corrected_plan[field_desc] = planned_item_dict # Fallback
                     else:
-                         # Fallback if somehow value wasn't in original list (shouldn't happen with good prompt)
-                         print(f"Warning: Value '{value_from_json}' from plan not found in original data. Using as is.")
-                         corrected_plan[key] = value_from_json
+                        print(f"Warning: Invalid item format in plan for field '{field_desc}'. Skipping.")
+
+                # Correct the unmatched items (similar logic)
+                for unmatched_item_dict in unmatched_list:
+                     if isinstance(unmatched_item_dict, dict) and 'description' in unmatched_item_dict:
+                        original_item = original_data_map.get(unmatched_item_dict['description'])
+                        if original_item and str(original_item['value']) == str(unmatched_item_dict.get('value')):
+                            corrected_unmatched.append(original_item)
+                        else:
+                             print(f"Warning: Could not reliably match unmatched item '{unmatched_item_dict.get('description')}' back to original data. Adding as is.")
+                             corrected_unmatched.append(unmatched_item_dict) # Fallback
+                     else:
+                         print("Warning: Invalid item format in unmatched_data list. Skipping item.")
+
+
                 parsed_result["plan"] = corrected_plan
+                parsed_result["unmatched_data"] = corrected_unmatched
                 return parsed_result
             else:
                 print("Error: Parsed JSON does not have the expected structure ('plan' and 'unmatched_data' keys). Returning empty plan.")
@@ -293,101 +370,107 @@ Provide ONLY the JSON object in your response, enclosed in ```json ... ```.
         print(f"Error during Gemini API call for plan generation: {e}")
         return {"plan": {}, "unmatched_data": data_to_fill}
 
-# --- Phase 3: Match Plan to Boxes --- (NEW FUNCTION)
-def match_plan_to_boxes(model, form_image_bytes, plan, detected_boxes):
-    """Uses Gemini to match items in the plan to detected bounding boxes."""
-    print("--- Phase 3: Matching Plan to Detected Boxes with Gemini ---")
+# --- Phase 3: Match Boxes to Data via Highlighted Image ---
+def match_plan_to_boxes(model, base_image, plan, detected_boxes):
+    """Uses Gemini to match detected boxes (highlighted on full image) to available data items."""
+    print("--- Phase 3: Matching Detected Boxes to Data Items via Highlighted Image ---")
     final_mapping = {}
+    # Make a mutable list of the data item dictionaries from the plan
+    # The plan maps descriptions -> data_dict. We just need the list of data_dicts.
+    available_data_items = list(plan.values()) if plan else []
 
     if not detected_boxes:
         print("Warning: No detected boxes provided. Cannot perform matching.")
         return final_mapping
 
-    if not plan:
-         print("Warning: Empty plan dictionary provided. Cannot perform matching.")
-         return final_mapping
+    if not available_data_items:
+        print("Warning: No data items available from the plan. Cannot perform matching.")
+        return final_mapping
 
-    # Prepare box list string for the prompt (only needs to be done once)
-    # Include index for easier reference if needed, though asking for coords is better
-    box_list_str = "\n".join([
-        f"- Box {i}: Coords: {box['box']}, Label: {box['label']}, Confidence: {box.get('confidence', 'N/A'):.2f}"
-        for i, box in enumerate(detected_boxes)
-    ])
+    print(f"Attempting to match {len(detected_boxes)} boxes to {len(available_data_items)} data items.")
 
-    image_part = Part.from_data(data=form_image_bytes, mime_type="image/png")
+    # Iterate through detected boxes
+    for i, box_dict in enumerate(detected_boxes):
+        if not available_data_items:
+            print("  No more data items available to match. Stopping box iteration.")
+            break # Stop if we've used all data
 
-    # Iterate through items in the generated plan dictionary directly
-    for field_description, data_value in plan.items():
-        print(f"  Matching: '{field_description}' -> '{data_value}'")
+        box_coords = box_dict['box']
+        field_type_hint = box_dict.get('label', 'unknown_field') # Use label as hint
+        confidence = box_dict.get('confidence', 0)
 
-        prompt = f"""Context: We are trying to fill a form field based on a plan.
-Form Image: Provided
-Field Description from Plan: "{field_description}"
+        print(f"\n  Processing Box {i}: Coords={box_coords}, Type Hint='{field_type_hint}', Conf={confidence:.2f}")
 
-List of Detected Bounding Boxes (from an object detection model):
-{box_list_str}
-
-Task: Identify the SINGLE best bounding box from the list above that visually corresponds to the "Field Description from Plan" on the provided Form Image. Consider the description, visual location, and box label.
-
-Respond with ONLY the exact coordinates (e.g., [x_min, y_min, x_max, y_max]) of the best matching bounding box from the list. Do not include the box index or label. If no suitable box is found in the list, respond with the exact string 'None'.
-"""
-
-        contents = [image_part, prompt] # Include image for visual matching
-
-        # Configure generation
-        generation_config = GenerationConfig(
-            temperature=0.1, # Low temp for deterministic matching
-            candidate_count=1,
-            max_output_tokens=8192, # Increase token limit for coordinates
-        )
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            # ... other safety settings ...
-        }
-
+        # --- Create Highlighted Image --- #
+        highlighted_image = None # Initialize
         try:
-            response = model.generate_content(
-                contents,
-                generation_config=generation_config,
-                # safety_settings=safety_settings, # Optional
-                stream=False
-            )
-            response_text = response.text.strip()
-            print(f"    Gemini Match Response: {response_text}")
+            highlighted_image = base_image.copy()
+            draw = ImageDraw.Draw(highlighted_image)
+            # Use a distinct color (e.g., magenta) and thickness for the highlight
+            highlight_color = "magenta"
+            highlight_thickness = 2 # Adjust as needed
+            draw.rectangle(box_coords, outline=highlight_color, width=highlight_thickness)
 
-            if response_text.lower() == 'none':
-                print(f"    -> Gemini indicated no match found for '{field_description}'")
-                continue
+            # Optional: Save highlighted image for debugging
+            # highlighted_image.save(f"debug_highlighted_box_{i}.png")
 
-            # Attempt to parse coordinates from the response (expecting format like [1.2, 3.4, 5.6, 7.8])
-            try:
-                # Be robust against minor formatting variations if possible
-                response_text = response_text.replace("(", "[").replace(")", "]") # Allow parentheses
-                if not (response_text.startswith("[") and response_text.endswith("]")):
-                     raise ValueError("Response not in expected list format")
-
-                # Parse numbers, handle potential ints or floats
-                coords_list = [float(c.strip()) for c in response_text.strip("[]").split(",")]
-
-                if len(coords_list) == 4:
-                    # Find the *original* box dict to preserve exact coords and label info if needed later
-                    # This is tricky as float precision might differ slightly.
-                    # A safer approach might be to ask Gemini for the *index* instead of coords.
-                    # For now, let's use the parsed coords directly. Convert to tuple for dict key.
-                    coords_tuple = tuple(coords_list)
-                    final_mapping[coords_tuple] = data_value
-                    print(f"    -> Matched '{field_description}' to Box Coords: {coords_tuple}")
-                else:
-                    print(f"    Error: Parsed coordinates list does not have 4 elements: {coords_list}")
-
-            except (ValueError, TypeError) as parse_error:
-                print(f"    Error: Could not parse coordinates from Gemini response '{response_text}'. Error: {parse_error}")
+            # Convert highlighted image to bytes for Gemini
+            buffer = BytesIO()
+            highlighted_image.save(buffer, format="PNG")
+            highlighted_image_bytes = buffer.getvalue()
 
         except Exception as e:
-            print(f"    Error during Gemini API call for box matching: {e}")
-            # Optionally retry?
+            print(f"    Error creating highlighted image for box {i}: {e}. Skipping box.")
+            if highlighted_image: # Clean up potential partial image
+                 del highlighted_image
+            continue
+        # --- End Highlight Creation --- #
 
-    print(f"Plan-to-box matching complete. {len(final_mapping)} items successfully mapped.")
+        # Ask Gemini to match the highlighted box against the *remaining* available data items
+        print(f"    Asking Gemini to match highlighted box against {len(available_data_items)} remaining data items...")
+        # Pass the highlighted image bytes
+        matched_item = get_match_from_gemini(model, highlighted_image_bytes, field_type_hint, available_data_items)
+
+        # Clean up the copied image object to save memory
+        del highlighted_image
+        del highlighted_image_bytes # And its bytes
+
+        if matched_item:
+            # Match found!
+            # Use the description from the matched item as the key in final_mapping
+            # This assumes descriptions uniquely identify the data items.
+            field_description = matched_item['description']
+            if field_description in final_mapping:
+                # This situation is less likely now but handle it defensively
+                print(f"    Warning: Data item '{field_description}' was already matched. Overwriting previous match for this data item with box {i}.")
+            else:
+                print(f"    Successfully matched Box {i} to Data: '{field_description}'")
+
+            final_mapping[field_description] = {
+                'data': matched_item, # Store the whole original item
+                'box': box_dict      # Store the box info associated with this match
+            }
+
+            # Remove the matched item from the available list
+            try:
+                available_data_items.remove(matched_item)
+                print(f"    Removed '{field_description}' from available items. {len(available_data_items)} remaining.")
+            except ValueError:
+                # Should not happen if matched_item came from the list, but handle defensively
+                print(f"    Error: Could not remove matched item '{field_description}' from available list.")
+        else:
+            # No confident match found by Gemini for this highlighted box
+            print(f"    -> No data item match found for Box {i} (highlighted).")
+
+    # Report unmatched items
+    if available_data_items:
+        print(f"\nWarning: {len(available_data_items)} data items could not be matched to any detected box:")
+        for item in available_data_items:
+            print(f"  - {item['description']}: {item['value']}")
+    else:
+        print("\nAll data items were successfully matched to boxes.")
+
+    print(f"Highlight-based matching complete. {len(final_mapping)} items mapped.")
     return final_mapping
 
 # --- Phase 4: Draw Final Mapping --- (NEW FUNCTION)
@@ -395,50 +478,90 @@ def draw_final_mapping(base_image, final_mapping, font_path, font_size):
     """Draws the data onto the image based on the final box-to-data mapping."""
     print("--- Phase 4: Drawing Final Mapping on Image ---")
     drawn_image = base_image.copy()
+    draw = ImageDraw.Draw(drawn_image) # Create Draw object once
+
+    # --- Load Font --- #
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except IOError:
+        print(f"Warning: Font '{font_path}' not found. Using default font.")
+        font = ImageFont.load_default()
+    # --- Get Font Metrics (assuming fixed font for all text) --- #
+    try:
+        # Get ascent (height above baseline) and descent (depth below baseline)
+        ascent, descent = font.getmetrics()
+        text_height_metric = ascent + descent # Total height based on font metrics
+        print(f"Using font: {font_path}, Size: {font_size}, Calculated Height (ascent+descent): {text_height_metric}")
+    except AttributeError:
+        # Fallback for default bitmap font which lacks getmetrics
+        print("Warning: Cannot get metrics from default font. Using approximate height.")
+        text_height_metric = font_size # Approximate height
+    # --- Define Padding --- #
+    left_padding = 3  # Pixels from left edge of box
+    bottom_padding = 1 # Pixels from bottom edge of box
 
     if not final_mapping:
         print("Warning: Final mapping is empty. Nothing to draw.")
         return drawn_image
 
     items_drawn = 0
-    for box_coords_tuple, data_value in final_mapping.items():
+    for field_description, mapping_info in final_mapping.items():
         try:
-            # Extract coordinates
-            x0, y0, x1, y1 = box_coords_tuple
+            data_dict = mapping_info['data']
+            if isinstance(data_dict, dict) and 'value' in data_dict:
+                actual_value = data_dict['value']
+            else:
+                print(f"    Warning: Unexpected data format for field '{field_description}'. Expected dict with 'value', got: {type(data_dict)}. Skipping.")
+                continue
+
+            box_dict = mapping_info['box']
+            x0, y0, x1, y1 = box_dict['box']
             box_width = x1 - x0
             box_height = y1 - y0
 
-            # Determine field type based on data type primarily
-            if isinstance(data_value, bool):
-                # Boolean -> Checkbox/Radio
+            print(f"  Processing '{field_description}': Value='{actual_value}', Box={box_dict['box']}")
+
+            if isinstance(actual_value, bool):
+                # --- Checkbox Drawing --- #
                 center_x = (x0 + x1) / 2
                 center_y = (y0 + y1) / 2
-                # Adjust size based on detected box, ensure it's not too large/small
                 check_size = max(5, min(box_width, box_height) * 0.7)
-
-                # Draw only if True (common convention, adjust if False needs drawing)
-                if data_value:
-                    # Using 'fill' for now, could be 'x' or 'checkmark'
+                if actual_value:
+                    # Pass the pre-created draw object
                     drawn_image = draw_checkbox_on_image(drawn_image, (center_x, center_y), size=check_size, checked=True, style='fill', color='black')
-                    print(f"  -> Drawn checkbox/radio at ~({center_x:.0f}, {center_y:.0f}) for data: {data_value}")
+                    print(f"    -> Drawn checkbox/radio at ~({center_x:.0f}, {center_y:.0f})")
                     items_drawn += 1
                 else:
-                    # If you need to explicitly mark 'False' (e.g., cross out), add logic here
-                    print(f"  -> Skipped drawing checkbox/radio for False value at ~({(x0+x1)/2:.0f}, {(y0+y1)/2:.0f})")
-                    # items_drawn += 1 # Count if you consider 'drawing nothing' an action
-            elif isinstance(data_value, str):
-                # String -> Text Input
-                # Position text slightly inside the top-left corner
-                text_pos = (x0 + min(5, box_width * 0.1), y0 + min(2, box_height * 0.1))
-                drawn_image = draw_text_on_image(drawn_image, data_value, text_pos, font_path=font_path, font_size=font_size, color="black")
-                print(f"  -> Drawn text starting at ({text_pos[0]:.0f}, {text_pos[1]:.0f}) for data: '{data_value[:30]}...'")
+                    print(f"    -> Skipped drawing checkbox/radio for False value at ~({center_x:.0f}, {center_y:.0f})")
+
+            elif isinstance(actual_value, (str, int, float)):
+                # --- Text Drawing (Bottom-Left Alignment) --- #
+                text_to_draw = str(actual_value)
+                if not text_to_draw: # Skip empty strings
+                     print(f"    -> Skipped drawing empty text.")
+                     continue
+
+                # Calculate X position (Left aligned with padding)
+                x_pos = x0 + left_padding
+
+                # Calculate Y position (Bottom aligned using font metrics)
+                # We want the bottom of the text box (baseline + descent, effectively text_height_metric) 
+                # to be at y1 - bottom_padding
+                y_pos = y1 - text_height_metric - bottom_padding
+                
+                # Adjust if calculated position is too high (e.g., tall box, short text)
+                y_pos = max(y0, y_pos) # Don't let text start above the box top
+
+                # Pass the pre-loaded font object
+                drawn_image = draw_text_on_image(drawn_image, text_to_draw, (x_pos, y_pos), font, color="black")
+                print(f"    -> Drawn text '{text_to_draw[:30]}...' starting at ({x_pos:.0f}, {y_pos:.0f})")
                 items_drawn += 1
             else:
-                # Handle other data types if necessary (e.g., numbers)
-                print(f"  Warning: Unsupported data type '{type(data_value)}' for drawing at box {box_coords_tuple}. Skipping.")
-
+                print(f"    Warning: Unsupported data type '{type(actual_value)}' for drawing at box {box_dict['box']}. Skipping.")
+        except KeyError as e:
+             print(f"    Error: Missing key '{e}' while processing field '{field_description}'. Data: {mapping_info}. Skipping.")
         except Exception as e:
-            print(f"Error drawing data '{data_value}' for box {box_coords_tuple}: {e}")
+            print(f"Error drawing data for field '{field_description}' (Box: {box_dict.get('box', 'N/A')}): {e}")
 
     print(f"Drawing complete. Attempted to draw {items_drawn} items based on final mapping.")
     return drawn_image
@@ -450,7 +573,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True, type=str, help="Path to the trained YOLOv8 model weights (.pt file).")
     parser.add_argument("--output", type=str, default="planned_filled_form.png", help="Path to save the final filled form image.")
     parser.add_argument("--font_path", type=str, default="/Library/Fonts/Arial Unicode.ttf", help="Path to the .ttf font file.")
-    parser.add_argument("--font_size", type=int, default=9, help="Font size for drawing text.")
+    parser.add_argument("--font_size", type=int, default=8, help="Font size for drawing text.")
     parser.add_argument("--conf", type=float, default=0.3, help="Confidence threshold for YOLO detections (0.0 to 1.0).")
     parser.add_argument("--annotated_detect_output", type=str, default="detected_boxes.png", help="Path to save the intermediate image with YOLO boxes drawn.")
 
@@ -482,25 +605,68 @@ if __name__ == "__main__":
 
     # --- Prepare Data (Using the same fake data for now) ---
     # !!! IMPORTANT: This data should ideally come from a structured source !!!
+    # Updated fake data with descriptions
     fake_data = [
-        True, # Q1 Yes (Nov-Apr)
-        True, # Q1 March Yes
-        False,# Q1 May No
-        True, # Q2 BOTH Yes
-        True, # Q2 Transport Yes
-        "Server at Cafe Bistro (2 years), Front desk volunteer at community center (1 year)",
-        "I enjoy customer interaction and thrive in fast-paced settings. I'm eager to contribute to a positive guest experience at the resort.",
-        "Listen actively, apologize sincerely, empathize with their frustration, and offer a concrete solution (e.g., replace item, offer discount). As a customer, I expect to be heard and have the problem resolved efficiently.",
-        "Check road conditions beforehand, leave significantly earlier to account for slow travel, ensure my vehicle is equipped for snow, and communicate any potential delays.",
-        True, # Q7 Food Handler Yes
-        "06/2026", # Q7 Expiration
-        False, # Q7 Mixologist No
-        "To gain valuable experience in resort hospitality, enhance my customer service skills, and contribute positively to the team environment.",
-        "1. Restock condiments/supplies. 2. Wipe down tables/counters. 3. Organize station. 4. Check on guests. 5. Assist colleagues.", # Shortened for brevity
-        True, False, False, True, True, True, True, # Q10 Weekdays (Mon-Sun)
-        True,  # Q10 Full Time
-        True, # Q11 Christmas Yes
-        "I am a reliable and enthusiastic worker, keen to learn quickly."
+        {"description": "Ordering Company Name", "value": "Example Corp"},
+        {"description": "Ordering Company Address", "value": "123 Supplier St"},
+        {"description": "Ordering Company City", "value": "Supplytown"},
+        {"description": "Ordering Company State", "value": "CA"},
+        {"description": "Ordering Company Zip Code", "value": "90210"},
+        {"description": "Ordering Company Contact Person", "value": "John Doe"},
+        {"description": "Ordering Company Phone Number", "value": "555-123-4567"},
+        {"description": "Ordering Company Fax Number", "value": "555-987-6543"},
+        {"description": "Ordering Company Email Address", "value": "john.doe@example.com"},
+        {"description": "Ordering Company Website", "value": "www.example.com"},
+        {"description": "Has DUNS Number (Checkbox)", "value": True},
+        {"description": "DUNS Number", "value": "123456789"},
+        {"description": "Has SIC/NAICS Code (Checkbox)", "value": True},
+        {"description": "SIC/NAICS Code", "value": "541511"},
+        {"description": "Provider Type: Wholesale (Checkbox)", "value": False},
+        {"description": "Provider Type: Retail (Checkbox)", "value": False},
+        {"description": "Provider Type: Manufacturing (Checkbox)", "value": True},
+        {"description": "Provider Type: Service Provider (Checkbox)", "value": False},
+        {"description": "Is Small Business (Yes Option)", "value": True},
+        {"description": "Is Small Business (No Option)", "value": False}, # Redundant but for matching
+        {"description": "Is Diversity-Owned Business (Yes Option)", "value": False},
+        {"description": "Is Diversity-Owned Business (No Option)", "value": True},
+        # Link is for registration, not a fillable field
+        {"description": "Remittance Payee Name", "value": "Example Corp Remittance"},
+        {"description": "Remittance Address", "value": "456 Payment Ave"},
+        {"description": "Remittance City", "value": "Payville"},
+        {"description": "Remittance State", "value": "NY"},
+        {"description": "Remittance Zip Code", "value": "10001"},
+        {"description": "Remittance Contact Person", "value": "Accounts Payable"},
+        {"description": "Remittance Phone Number", "value": "555-111-2222"},
+        {"description": "Remittance Fax Number", "value": "555-333-4444"},
+        {"description": "Discount Percentage", "value": "2"}, # Should be number? Using string for now based on prev
+        {"description": "Discount Days", "value": "10"}, # Should be number?
+        {"description": "Discount Terms: Net (Checkbox)", "value": True},
+        # Xcel Energy Policy Net Terms 30 unless discount is given - Not a fillable field
+        {"description": "Is Employee of Xcel Energy (Yes Option)", "value": False},
+        {"description": "Is Employee of Xcel Energy (No Option)", "value": True},
+        {"description": "Related to Employee of Xcel Energy (Yes Option)", "value": False},
+        {"description": "Related to Employee of Xcel Energy (No Option)", "value": True},
+        # W9 Information Section Header - Not a fillable field
+        {"description": "W9 Checkbox: Individual/Sole Proprietor", "value": True},
+        {"description": "W9 Checkbox: Corporation", "value": False},
+        {"description": "W9 Checkbox: Partnership", "value": False},
+        {"description": "W9 Checkbox: Other", "value": False},
+        {"description": "State of Incorporation", "value": "Delaware"},
+        {"description": "Exempt from Backup Withholding (Yes Option)", "value": False},
+        {"description": "Exempt from Backup Withholding (No Option)", "value": True},
+        {"description": "Federal Tax ID Number", "value": "12-3456789"},
+        {"description": "Tax ID Type: Manufacturer (Radio)", "value": False},
+        {"description": "Tax ID Type: Vendor (Radio)", "value": False},
+        {"description": "Tax ID Type: Both (Radio)", "value": True},
+        # Social Security # (if applicable) - Assuming Federal Tax ID is provided, maybe add placeholder? {"description": "Social Security Number (Optional)", "value": ""},
+        {"description": "IRS Registered Name", "value": "Example Corp"},
+        {"description": "IRS Registered Address", "value": "123 Tax St"},
+        {"description": "IRS Registered City", "value": "Taxington"},
+        {"description": "IRS Registered State", "value": "DE"},
+        {"description": "IRS Registered Zip Code", "value": "19901"},
+        # Signature field - Usually not filled by script unless generating signature image
+        # Date field - Often needs current date logic
+        {"description": "Form Signature Date", "value": "2023-10-27"}
     ]
 
     # --- Phase 1: Generate Plan ---
@@ -530,7 +696,7 @@ if __name__ == "__main__":
     print(f"Detected {len(detected_bboxes)} boxes above threshold {args.conf}.")
 
     # --- Phase 3: Match Plan to Boxes ---
-    final_mapping = match_plan_to_boxes(match_model, form_image_bytes, filling_plan, detected_bboxes)
+    final_mapping = match_plan_to_boxes(match_model, base_image, filling_plan, detected_bboxes)
 
     if not final_mapping:
         print("Warning: Failed to match any planned items to detected boxes.")

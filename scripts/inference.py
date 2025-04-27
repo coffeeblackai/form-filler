@@ -81,8 +81,8 @@ def run_inference(model_path, image_path, output_path=None, conf_thresh=0.25):
         conf = box.conf.item()        # Get confidence score
         coords = box.xyxy[0].tolist() # Get coordinates [x1, y1, x2, y2]
         
-        label = f"{model.names[class_id]}: {conf:.2f}"
-        annotator.box_label(coords, label, color=colors(class_id, True))
+        # label = f"{model.names[class_id]}: {conf:.2f}" # Removed label generation
+        annotator.box_label(coords, label=None, color=colors(class_id, True)) # Pass None for label
         detected_boxes += 1
         boxes.append({'box': coords, 'label': model.names[class_id], 'confidence': conf})
     
